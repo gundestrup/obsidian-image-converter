@@ -23,6 +23,7 @@ import { hexToRgba, rgbaToHex, rgbaToHexWithAlpha, analyzeImageColors, updateRgb
 import { HistoryManager, ViewportManager, LayerManager, ToolManager, BackgroundManager } from './managers';
 import { ToolbarBuilder, ToolbarCallbacks } from './ui';
 import { ImageExporter } from './export/ImageExporter';
+import { MosaicTool, isMosaicImage } from './tools/MosaicTool';
 
 type FabricObjectWithHistoryFlag = FabricObject & {
     excludeFromHistory?: boolean;
@@ -45,8 +46,12 @@ export class ImageAnnotationModal extends Modal {
     private imageExporter!: ImageExporter;
     private toolbarBuilder!: ToolbarBuilder;
 
+    // Tools
+    private mosaicTool!: MosaicTool;
+
     // UI Elements
     private textBackgroundControls: HTMLElement | null = null;
+    private mosaicBlockSizeControls: HTMLElement | null = null;
 
     // State
     private isTextEditingBlocked = false;
@@ -243,6 +248,17 @@ export class ImageAnnotationModal extends Modal {
 
         this.backgroundManager = new BackgroundManager(getCanvas, this.componentContainer);
         this.imageExporter = new ImageExporter(this.app, filePath => isPathExcluded(filePath, this.plugin.settings));
+
+        this.mosaicTool = new MosaicTool(
+            getCanvas,
+            () => {
+                const { canvas } = this;
+                if (!canvas) return null;
+                const [bg] = canvas.getObjects();
+                return bg instanceof FabricImage ? bg : null;
+            },
+            () => this.historyManager.saveState()
+        );
     }
 
     private setupToolbar(container: HTMLElement): void {
@@ -250,6 +266,7 @@ export class ImageAnnotationModal extends Modal {
             onDrawingToggle: () => this.toolManager.toggleDrawingMode(),
             onTextToggle: () => this.toolManager.toggleTextMode(),
             onArrowToggle: () => this.toolManager.toggleArrowMode(),
+            onMosaicToggle: () => this.toolManager.toggleMosaicMode(),
             onResetZoom: () => this.viewportManager.resetZoom(),
             onClearAll: () => this.clearAll(),
             onSave: () => { void this.saveAnnotation(); },
@@ -265,21 +282,25 @@ export class ImageAnnotationModal extends Modal {
             onPresetSave: (index) => { void this.savePreset(index); },
             onPresetLoad: (index) => this.loadPreset(index),
             onTextBackgroundChange: (color) => this.setTextBackground(color),
+            onMosaicBlockSizeChange: (index) => this.mosaicTool.setBlockSizeIndex(index),
             getCanvas: () => this.canvas,
             getCurrentOpacity: () => this.toolManager.getCurrentOpacity(),
             getBrushSizeIndex: () => this.toolManager.getBrushSizeIndex(),
             getOpacityIndex: () => this.toolManager.getOpacityIndex(),
             getBlendMode: () => this.toolManager.getBlendMode(),
+            getMosaicBlockSizeIndex: () => this.mosaicTool.getBlockSizeIndex(),
             isDrawingMode: () => this.toolManager.isInDrawingMode(),
             isTextMode: () => this.toolManager.isInTextMode(),
-            isArrowMode: () => this.toolManager.isInArrowMode()
+            isArrowMode: () => this.toolManager.isInArrowMode(),
+            isMosaicMode: () => this.toolManager.isInMosaicMode()
         };
 
         this.toolbarBuilder = new ToolbarBuilder(this.componentContainer, this.modalEl, callbacks);
         const elements = this.toolbarBuilder.build(container);
 
-        this.toolManager.setButtons(elements.drawButton, elements.textButton, elements.arrowButton);
+        this.toolManager.setButtons(elements.drawButton, elements.textButton, elements.arrowButton, elements.mosaicButton);
         this.textBackgroundControls = elements.textBackgroundControls;
+        this.mosaicBlockSizeControls = elements.mosaicBlockSizeControls;
 
         // Setup background controls
         const utilityGroup = this.modalEl.querySelector('.annotation-toolbar-group:last-child');
@@ -296,10 +317,20 @@ export class ImageAnnotationModal extends Modal {
             this.textBackgroundControls.toggleClass('is-hidden', tool !== ToolMode.TEXT);
         }
 
+        // Handle mosaic block size controls visibility
+        if (this.mosaicBlockSizeControls) {
+            this.mosaicBlockSizeControls.toggleClass('is-hidden', tool !== ToolMode.MOSAIC);
+        }
+
+        // Cancel any in-progress mosaic drag when switching away
+        if (tool !== ToolMode.MOSAIC) {
+            this.mosaicTool.cancel();
+        }
+
         // Show/hide preset buttons
         const presetContainer = this.modalEl.querySelector('.image-converter-annotation-tool-preset-buttons');
         if (presetContainer instanceof HTMLElement) {
-            presetContainer.toggleClass('is-hidden', tool === ToolMode.NONE);
+            presetContainer.toggleClass('is-hidden', tool === ToolMode.NONE || tool === ToolMode.MOSAIC);
             this.updatePresetButtons();
         }
     }
@@ -343,12 +374,12 @@ export class ImageAnnotationModal extends Modal {
                 if (activeObject instanceof ActiveSelection) {
                     const selection = activeObject;
                     selection.getObjects().forEach(obj => {
-                        if (!(obj instanceof FabricImage)) {
+                        if (!(obj instanceof FabricImage) || isMosaicImage(obj)) {
                             obj.globalCompositeOperation = mode;
                         }
                     });
                     selection.dirty = true;
-                } else if (!(activeObject instanceof FabricImage)) {
+                } else if (!(activeObject instanceof FabricImage) || isMosaicImage(activeObject)) {
                     activeObject.globalCompositeOperation = mode;
                 }
                 this.canvas.requestRenderAll();
@@ -469,6 +500,13 @@ export class ImageAnnotationModal extends Modal {
             return false;
         });
 
+        this.scope.register([], 'M', (evt: KeyboardEvent) => {
+            if (this.isTextEditing()) return true;
+            evt.preventDefault();
+            this.toolManager.toggleMosaicMode();
+            return false;
+        });
+
         this.scope.register([], 'Delete', (evt: KeyboardEvent) => {
             evt.preventDefault();
             this.deleteSelectedObjects();
@@ -525,7 +563,11 @@ export class ImageAnnotationModal extends Modal {
         this.toolManager.updateBrushColor();
 
         const shouldIgnoreHistoryTarget = (target?: FabricObject): boolean => {
-            if (target instanceof FabricImage || this.historyManager.isPerformingUndoRedo()) {
+            if (this.historyManager.isPerformingUndoRedo()) {
+                return true;
+            }
+            // Skip background image but allow mosaic images
+            if (target instanceof FabricImage && !isMosaicImage(target)) {
                 return true;
             }
 
@@ -567,12 +609,33 @@ export class ImageAnnotationModal extends Modal {
         });
 
         this.canvas.on('mouse:down', (opt) => {
+            // Mosaic mode handling
+            if (this.toolManager.isInMosaicMode() && !this.viewportManager.isSpacebarPressed()) {
+                const pointer = this.canvas.getScenePoint(opt.e);
+                this.mosaicTool.onMouseDown(pointer.x, pointer.y);
+                return;
+            }
+
             const { target } = opt;
             if (target instanceof IText) {
                 this.toolManager.updateDrawingModeUI(false);
                 this.isTextEditingBlocked = false;
                 target.selectable = true;
                 target.evented = true;
+            }
+        });
+
+        this.canvas.on('mouse:move', (opt) => {
+            if (this.toolManager.isInMosaicMode() && !this.viewportManager.isSpacebarPressed()) {
+                const pointer = this.canvas.getScenePoint(opt.e);
+                this.mosaicTool.onMouseMove(pointer.x, pointer.y);
+            }
+        });
+
+        this.canvas.on('mouse:up', (opt) => {
+            if (this.toolManager.isInMosaicMode() && !this.viewportManager.isSpacebarPressed()) {
+                const pointer = this.canvas.getScenePoint(opt.e);
+                this.mosaicTool.onMouseUp(pointer.x, pointer.y);
             }
         });
 
@@ -707,7 +770,8 @@ export class ImageAnnotationModal extends Modal {
                 e.key === 'Backspace' ||
                 e.key.toLowerCase() === 'b' ||
                 e.key.toLowerCase() === 't' ||
-                e.key.toLowerCase() === 'a'
+                e.key.toLowerCase() === 'a' ||
+                e.key.toLowerCase() === 'm'
             ))
         );
     }
@@ -848,6 +912,8 @@ export class ImageAnnotationModal extends Modal {
             this.plugin.settings.annotationPresets.arrow[index] = preset;
         } else if (this.toolManager.isInTextMode()) {
             this.plugin.settings.annotationPresets.text[index] = preset;
+        } else if (this.toolManager.isInMosaicMode()) {
+            this.plugin.settings.annotationPresets.mosaic[index] = preset;
         }
 
         await this.plugin.saveSettings();
@@ -864,6 +930,8 @@ export class ImageAnnotationModal extends Modal {
             preset = this.plugin.settings.annotationPresets.arrow[index];
         } else if (this.toolManager.isInTextMode()) {
             preset = this.plugin.settings.annotationPresets.text[index];
+        } else if (this.toolManager.isInMosaicMode()) {
+            preset = this.plugin.settings.annotationPresets.mosaic[index];
         } else {
             return;
         }
@@ -946,7 +1014,9 @@ export class ImageAnnotationModal extends Modal {
                 ? this.plugin.settings.annotationPresets.arrow
                 : this.toolManager.isInTextMode()
                     ? this.plugin.settings.annotationPresets.text
-                    : null;
+                    : this.toolManager.isInMosaicMode()
+                        ? this.plugin.settings.annotationPresets.mosaic
+                        : null;
 
         if (currentPresets) {
             this.toolbarBuilder.updatePresetButtons(currentPresets, this.toolManager.isInTextMode());
@@ -968,14 +1038,16 @@ export class ImageAnnotationModal extends Modal {
             const objectsToRemove = activeSelection.getObjects();
 
             objectsToRemove.forEach(obj => {
-                if (!(obj instanceof FabricImage)) {
+                // Allow deleting mosaic images but not background image
+                if (!(obj instanceof FabricImage) || isMosaicImage(obj)) {
                     this.canvas?.remove(obj);
                 }
             });
 
             this.canvas.discardActiveObject();
         } else {
-            if (!(activeObject instanceof FabricImage)) {
+            // Allow deleting mosaic images but not background image
+            if (!(activeObject instanceof FabricImage) || isMosaicImage(activeObject)) {
                 this.canvas.remove(activeObject);
             }
         }
@@ -1054,6 +1126,7 @@ export class ImageAnnotationModal extends Modal {
         this.componentContainer.unload();
 
         this.isTextEditingBlocked = false;
+        this.mosaicTool?.cleanup();
         this.toolManager?.cleanup();
         this.viewportManager?.cleanup();
         this.historyManager?.clear();
